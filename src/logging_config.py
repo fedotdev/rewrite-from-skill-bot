@@ -1,6 +1,6 @@
 import logging
 import sys
-from typing import Any
+from typing import cast
 
 import structlog
 from structlog.types import EventDict, Processor
@@ -8,12 +8,12 @@ from structlog.types import EventDict, Processor
 from config import get_settings
 
 
-def drop_color_message_key(_, __, event_dict: EventDict) -> EventDict:
+def drop_color_message_key(_: str, __: str, event_dict: EventDict) -> EventDict:
     event_dict.pop("color_message", None)
     return event_dict
 
 
-def add_correlation_id(_, __, event_dict: EventDict) -> EventDict:
+def add_correlation_id(_: str, __: str, event_dict: EventDict) -> EventDict:
     return event_dict
 
 
@@ -63,4 +63,4 @@ def setup_logging() -> None:
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
-    return structlog.get_logger(name)
+    return cast(structlog.stdlib.BoundLogger, structlog.get_logger(name))

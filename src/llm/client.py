@@ -1,7 +1,6 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import httpx
 from tenacity import (
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class LLMResponse:
     text: str
-    warning: Optional[str] = None
+    warning: str | None = None
 
 
 class LLMClientError(RewriteError):
@@ -79,7 +78,6 @@ class LLMClient:
         reraise=True,
     )
     async def _call_api(self, messages: list[dict[str, str]]) -> LLMResponse:
-        settings = get_settings()
         payload = {
             "model": self._model,
             "messages": messages,

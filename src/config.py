@@ -1,5 +1,4 @@
 from functools import lru_cache
-from typing import List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,7 +13,7 @@ class Settings(BaseSettings):
     )
 
     bot_token: str = Field(..., validation_alias="BOT_TOKEN")
-    allowed_chat_ids: List[int] = Field(default_factory=list, validation_alias="ALLOWED_CHAT_IDS")
+    allowed_chat_ids: list[int] = Field(default_factory=list, validation_alias="ALLOWED_CHAT_IDS")
 
     llm_api_url: str = Field(default="https://api.openai.com/v1/chat/completions", validation_alias="LLM_API_URL")
     llm_api_key: str = Field(..., validation_alias="LLM_API_KEY")
@@ -26,12 +25,9 @@ class Settings(BaseSettings):
     rate_limit_per_user_per_minute: int = Field(default=20, validation_alias="RATE_LIMIT_PER_USER_PER_MINUTE")
     rate_limit_per_chat_per_minute: int = Field(default=100, validation_alias="RATE_LIMIT_PER_CHAT_PER_MINUTE")
 
-    redis_url: str = Field(default="redis://localhost:6379/0", validation_alias="REDIS_URL")
-    use_redis: bool = Field(default=False, validation_alias="USE_REDIS")
-
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    return Settings()  # type: ignore[call-arg]
