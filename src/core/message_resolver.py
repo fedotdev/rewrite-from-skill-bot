@@ -81,6 +81,17 @@ def parse_rewrite_request(
                 message="Replied message has no text or caption",
                 user_facing="Можно переписывать только текстовые сообщения или подписи к медиа.",
             )
+        # a mention inside the quote is not part of the text to rewrite
+        quoted_mention = find_bot_mention(replied, bot_username, bot_id)
+        if quoted_mention is not None:
+            stripped = remove_mention(replied_text, quoted_mention)
+            if not stripped:
+                raise MessageParseError(
+                    message="Replied message contains nothing but a mention",
+                    user_facing="В сообщении, на которое вы ответили, есть только упоминание бота.",
+                )
+            replied_text = stripped
+
         current_text, _ = get_text_and_entities(message)
         instruction = remove_mention(current_text, mention_entity) if current_text else ""
         return ParsedMessage(

@@ -1,12 +1,11 @@
 import json
-import time
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from core.models import RewriteRequest, RewriteResult
-from llm.client import LLMClient, LLMClientError
+from llm.client import LLMClient, LLMClientError, _backoff
 
 
 def make_request(source: str = "привет", instruction: str | None = None) -> RewriteRequest:
@@ -55,10 +54,103 @@ def attach(client: LLMClient, handler) -> list[dict]:
     return sent
 
 
+@pytest.fixture
+def fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep retry-loop tests fast; the maths itself is asserted separately."""
+    monkeypatch.setattr("llm.client.RETRY_BASE_SECONDS", 0.001)
+    monkeypatch.setattr("llm.client.RETRY_MAX_SECONDS", 0.002)
+
+
+def fake_state(exc: BaseException | None, attempt: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        outcome=SimpleNamespace(exception=lambda: exc), attempt_number=attempt
+    )
+
+
+def status_error(status: int, headers: dict[str, str] | None = None) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://x/chat/completions")
+    response = httpx.Response(status, headers=headers or {}, json={"error": {}}, request=request)
+    return httpx.HTTPStatusError("boom", request=request, response=response)
+
+
+# --- backoff maths (computed, never slept through) ------------------------
+
+
+def test_backoff_starts_at_base() -> None:
+    from llm.client import RETRY_BASE_SECONDS
+
+    assert _backoff(1) >= RETRY_BASE_SECONDS
+
+
+def test_backoff_grows_exponentially() -> None:
+    from llm.client import RETRY_BASE_SECONDS, RETRY_JITTER_RATIO
+
+    low_1 = min(RETRY_BASE_SECONDS, _backoff(1))
+    low_2 = min(RETRY_BASE_SECONDS * 2, _backoff(2))
+
+    assert low_2 > low_1
+    assert _backoff(2) >= RETRY_BASE_SECONDS * 2 * (1 - RETRY_JITTER_RATIO)
+
+
+def test_backoff_is_capped_at_max() -> None:
+    from llm.client import RETRY_BASE_SECONDS, RETRY_MAX_SECONDS
+
+    for attempt in range(1, 12):
+        assert _backoff(attempt) <= RETRY_MAX_SECONDS
+    assert RETRY_MAX_SECONDS > RETRY_BASE_SECONDS
+
+
+def test_backoff_has_jitter() -> None:
+    values = {_backoff(2) for _ in range(50)}
+
+    assert len(values) > 1
+
+
+def test_503_without_retry_after_waits_at_least_base() -> None:
+    from llm.client import RETRY_BASE_SECONDS, _wait_before_retry
+
+    exc = status_error(503)
+    for attempt in (1, 2, 3):
+        assert _wait_before_retry(fake_state(exc, attempt)) >= RETRY_BASE_SECONDS
+
+
+def test_429_retry_after_overrides_backoff() -> None:
+    from llm.client import _wait_before_retry
+
+    exc = status_error(429, headers={"Retry-After": "5"})
+
+    assert _wait_before_retry(fake_state(exc, 1)) == 5.0
+
+
+def test_retry_after_is_capped() -> None:
+    from llm.client import MAX_RETRY_AFTER_SECONDS, _wait_before_retry
+
+    exc = status_error(429, headers={"Retry-After": "9999"})
+
+    assert _wait_before_retry(fake_state(exc, 1)) == MAX_RETRY_AFTER_SECONDS
+
+
+def test_bad_retry_after_falls_back_to_backoff() -> None:
+    from llm.client import RETRY_BASE_SECONDS, _wait_before_retry
+
+    exc = status_error(429, headers={"Retry-After": "soon"})
+
+    assert _wait_before_retry(fake_state(exc, 1)) >= RETRY_BASE_SECONDS
+
+
+def test_backoff_reads_module_constants(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("llm.client.RETRY_BASE_SECONDS", 3.0)
+    monkeypatch.setattr("llm.client.RETRY_MAX_SECONDS", 3.0)
+
+    assert _backoff(5) == 3.0
+
+
 # --- retry behaviour -------------------------------------------------------
 
 
-async def test_429_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_429_is_retried_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch, fast_backoff: None
+) -> None:
     client = make_client(monkeypatch)
     calls = {"n": 0}
 
@@ -75,7 +167,9 @@ async def test_429_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> 
     assert len(sent) == 3
 
 
-async def test_503_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_503_is_retried_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch, fast_backoff: None
+) -> None:
     client = make_client(monkeypatch)
     calls = {"n": 0}
 
@@ -90,7 +184,9 @@ async def test_503_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> 
     assert (await client.rewrite(make_request(), "стиль")).text == "готово"
 
 
-async def test_429_exhausts_attempts_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_429_exhausts_attempts_and_raises(
+    monkeypatch: pytest.MonkeyPatch, fast_backoff: None
+) -> None:
     client = make_client(monkeypatch)
     sent = attach(client, lambda r: httpx.Response(429, json={"error": {"message": "slow down"}}))
 
@@ -101,7 +197,9 @@ async def test_429_exhausts_attempts_and_raises(monkeypatch: pytest.MonkeyPatch)
     assert len(sent) == 3
 
 
-async def test_503_exhausts_attempts_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_503_exhausts_attempts_and_raises(
+    monkeypatch: pytest.MonkeyPatch, fast_backoff: None
+) -> None:
     client = make_client(monkeypatch)
     sent = attach(client, lambda r: httpx.Response(503, json={"error": {"message": "upstream"}}))
 
@@ -112,7 +210,9 @@ async def test_503_exhausts_attempts_and_raises(monkeypatch: pytest.MonkeyPatch)
     assert len(sent) == 3
 
 
-async def test_timeout_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_timeout_is_retried(
+    monkeypatch: pytest.MonkeyPatch, fast_backoff: None
+) -> None:
     client = make_client(monkeypatch)
     calls = {"n": 0}
 
@@ -127,36 +227,9 @@ async def test_timeout_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (await client.rewrite(make_request(), "стиль")).text == "готово"
 
 
-async def test_retry_after_header_is_respected(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = make_client(monkeypatch)
-    sent = attach(
-        client,
-        lambda r: httpx.Response(429, headers={"Retry-After": "0.2"}, json={"error": {}}),
-    )
-
-    started = time.monotonic()
-    with pytest.raises(LLMClientError):
-        await client.rewrite(make_request(), "стиль")
-    elapsed = time.monotonic() - started
-
-    assert len(sent) == 3
-    # two backoffs of at least the advertised Retry-After
-    assert elapsed >= 0.4
-
-
-async def test_retry_after_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
-    from llm.client import MAX_RETRY_AFTER_SECONDS, _wait_before_retry
-
-    response = httpx.Response(429, headers={"Retry-After": "9999"}, request=httpx.Request("POST", "u"))
-    exc = httpx.HTTPStatusError("rate", request=response.request, response=response)
-    state = SimpleNamespace(outcome=SimpleNamespace(exception=lambda: exc), attempt_number=1)
-
-    assert _wait_before_retry(state) == MAX_RETRY_AFTER_SECONDS
-
-
 @pytest.mark.parametrize("status", [400, 401, 402, 403, 404])
 async def test_client_errors_are_not_retried(
-    monkeypatch: pytest.MonkeyPatch, status: int
+    monkeypatch: pytest.MonkeyPatch, status: int, fast_backoff: None
 ) -> None:
     client = make_client(monkeypatch)
     sent = attach(client, lambda r: httpx.Response(status, json={"error": {"message": "no"}}))
@@ -219,6 +292,90 @@ async def test_missing_choices_is_reported(monkeypatch: pytest.MonkeyPatch) -> N
         await client.rewrite(make_request(), "стиль")
 
     assert "некорректный ответ" in exc.value.user_facing
+
+
+# --- 200 with a malformed body (never retried) ---------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<html>error</html>",
+        "[]",
+        '"just a string"',
+        "not json at all",
+        "",
+    ],
+)
+async def test_malformed_json_body_is_reported(
+    monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    client = make_client(monkeypatch)
+    sent = attach(client, lambda r: httpx.Response(200, text=body))
+
+    with pytest.raises(LLMClientError) as exc:
+        await client.rewrite(make_request(), "стиль")
+
+    assert exc.value.user_facing == "Модель вернула некорректный ответ. Попробуйте ещё раз."
+    assert len(sent) == 1, "malformed body must not be retried"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"choices": ["x"]},
+        {"choices": ["x", {"message": {"content": "ok"}}]},
+        {"choices": [None]},
+        {"choices": [42]},
+    ],
+)
+async def test_malformed_choice_is_reported(
+    monkeypatch: pytest.MonkeyPatch, payload: dict
+) -> None:
+    client = make_client(monkeypatch)
+    sent = attach(client, lambda r: httpx.Response(200, json=payload))
+
+    with pytest.raises(LLMClientError) as exc:
+        await client.rewrite(make_request(), "стиль")
+
+    assert exc.value.user_facing == "Модель вернула некорректный ответ. Попробуйте ещё раз."
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"choices": [{"message": "not a dict"}]},
+        {"choices": [{"message": None}]},
+        {"choices": [{}]},
+        {"choices": [{"role": "assistant"}]},
+    ],
+)
+async def test_malformed_message_is_reported(
+    monkeypatch: pytest.MonkeyPatch, payload: dict
+) -> None:
+    client = make_client(monkeypatch)
+    sent = attach(client, lambda r: httpx.Response(200, json=payload))
+
+    with pytest.raises(LLMClientError) as exc:
+        await client.rewrite(make_request(), "стиль")
+
+    assert exc.value.user_facing == "Модель вернула некорректный ответ. Попробуйте ещё раз."
+    assert len(sent) == 1
+
+
+async def test_malformed_body_does_not_leak_source_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "суперсекретный исходник"
+    client = make_client(monkeypatch)
+    attach(client, lambda r: httpx.Response(200, text="<html>nope</html>"))
+
+    with pytest.raises(LLMClientError) as exc:
+        await client.rewrite(make_request(secret), "стиль")
+
+    assert secret not in exc.value.message
+    assert secret not in exc.value.user_facing
 
 
 # --- request shape ---------------------------------------------------------

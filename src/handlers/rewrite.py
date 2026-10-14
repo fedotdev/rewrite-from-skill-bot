@@ -45,19 +45,21 @@ async def handle_rewrite(message: Message, service: RewriteService) -> None:
         logger.info("Duplicate message ignored", chat_id=message.chat.id, message_id=message.message_id)
         return
 
-    user_result, chat_result = service.check_rate_limits(
-        message.from_user.id if message.from_user else 0,
-        message.chat.id,
-    )
+    user_id = message.from_user.id if message.from_user else 0
+    user_result, chat_result = service.check_rate_limits(user_id, message.chat.id)
     if not user_result.allowed:
-        await message.reply(
-            f"Слишком много запросов. Попробуйте через {int(user_result.retry_after_seconds)} сек."
-        )
+        if service.should_warn_user_limit(
+            message.chat.id, user_id, user_result.retry_after_seconds
+        ):
+            await message.reply(
+                f"Слишком много запросов. Попробуйте через {int(user_result.retry_after_seconds)} сек."
+            )
         return
     if not chat_result.allowed:
-        await message.reply(
-            f"Чат достиг лимита. Попробуйте через {int(chat_result.retry_after_seconds)} сек."
-        )
+        if service.should_warn_chat_limit(message.chat.id, chat_result.retry_after_seconds):
+            await message.reply(
+                f"Чат достиг лимита. Попробуйте через {int(chat_result.retry_after_seconds)} сек."
+            )
         return
 
     try:

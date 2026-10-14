@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING
 from core.deduplication import Deduplicator
 from core.message_resolver import MessageParseError, build_rewrite_request, find_bot_mention
 from core.models import RewriteRequest, RewriteResult
-from core.rate_limiter import CompositeRateLimiter, RateLimitResult
+from core.rate_limiter import CompositeRateLimiter, RateLimitResult, WarningThrottle
 from core.style_loader import StyleLoader
 from llm.client import LLMClient
 
@@ -21,6 +21,7 @@ class RewriteService:
         bot_username: str,
         bot_id: int,
         style_loader: StyleLoader | None = None,
+        warning_throttle: WarningThrottle | None = None,
     ) -> None:
         if not bot_username:
             raise ValueError("bot_username is required")
@@ -32,6 +33,7 @@ class RewriteService:
         self._bot_username = bot_username
         self._bot_id = bot_id
         self._style_loader = style_loader or StyleLoader()
+        self._warning_throttle = warning_throttle or WarningThrottle()
 
     @property
     def has_allowed_chats(self) -> bool:
@@ -57,6 +59,12 @@ class RewriteService:
     def check_deduplication(self, chat_id: int, message_id: int) -> bool:
         result = self._dedup.check_and_mark(f"msg:{chat_id}:{message_id}")
         return result.is_duplicate
+
+    def should_warn_user_limit(self, chat_id: int, user_id: int, retry_after: float) -> bool:
+        return self._warning_throttle.should_warn(f"user:{chat_id}:{user_id}", retry_after)
+
+    def should_warn_chat_limit(self, chat_id: int, retry_after: float) -> bool:
+        return self._warning_throttle.should_warn(f"chat:{chat_id}", retry_after)
 
     async def process(self, request: RewriteRequest) -> RewriteResult:
         return await self._llm.rewrite(request, self._style_loader.load())

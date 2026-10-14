@@ -1,6 +1,5 @@
 import pytest
 from aiogram.types import MessageEntity, User
-from aiogram.utils.text_decorations import add_surrogates
 
 from core.message_resolver import (
     MessageParseError,
@@ -306,7 +305,62 @@ def test_text_mention_of_other_user_is_not_a_mention():
     assert parse_rewrite_request(msg, BOT, bot_id=BOT_ID) is None
 
 
-# --- 8. whitespace at the seam --------------------------------------------
+# --- 8. mention inside the quoted message ----------------------------------
+
+
+def test_mention_inside_reply_text_is_stripped():
+    quoted = FakeMessage(text="@testbot привет", entities=mention_at("@testbot привет", "@testbot"))
+    parsed = parse_rewrite_request(bot_message("@testbot", reply_to_message=quoted), BOT)
+    assert parsed is not None
+    assert parsed.source_text == "привет"
+    assert "@testbot" not in parsed.source_text
+
+
+def test_mention_inside_reply_text_with_instruction():
+    quoted = FakeMessage(text="@testbot длинный текст", entities=mention_at("@testbot длинный текст", "@testbot"))
+    parsed = parse_rewrite_request(
+        bot_message("@testbot короче", reply_to_message=quoted), BOT
+    )
+    assert parsed is not None
+    assert parsed.source_text == "длинный текст"
+    assert parsed.user_instruction == "короче"
+
+
+def test_foreign_mention_inside_reply_text_is_kept():
+    text = "@otherbot привет"
+    quoted = FakeMessage(text=text, entities=mention_at(text, "@otherbot"))
+    parsed = parse_rewrite_request(bot_message("@testbot", reply_to_message=quoted), BOT)
+    assert parsed is not None
+    assert parsed.source_text == "@otherbot привет"
+
+
+def test_mention_inside_reply_caption_is_stripped():
+    caption = "@testbot подпись"
+    quoted = FakeCaptionMessage(
+        caption=caption,
+        caption_entities=[MessageEntity(type="mention", offset=0, length=len("@testbot"))],
+    )
+    parsed = parse_rewrite_request(bot_message("@testbot", reply_to_message=quoted), BOT)
+    assert parsed is not None
+    assert parsed.source_text == "подпись"
+
+
+def test_reply_containing_only_a_mention_raises():
+    quoted = FakeMessage(text="@testbot", entities=mention_at("@testbot", "@testbot"))
+    with pytest.raises(MessageParseError) as exc:
+        parse_rewrite_request(bot_message("@testbot", reply_to_message=quoted), BOT)
+    assert "только упоминание" in exc.value.user_facing
+
+
+def test_mention_inside_reply_after_astral_emoji_is_stripped():
+    text = "🙂 @testbot привет"
+    quoted = FakeMessage(text=text, entities=mention_at(text, "@testbot"))
+    parsed = parse_rewrite_request(bot_message("@testbot", reply_to_message=quoted), BOT)
+    assert parsed is not None
+    assert parsed.source_text == "🙂 привет"
+
+
+# --- 9. whitespace at the seam --------------------------------------------
 
 
 def test_double_space_at_cut_is_removed():
@@ -317,6 +371,39 @@ def test_double_space_at_cut_is_removed():
     assert remove_mention(text, entity) == "привет текст"
 
 
-def test_surrogates_helper_is_used_for_offsets():
-    # sanity check of the helper the implementation relies on
-    assert add_surrogates("🙂").decode("utf-16-le")[0:2] != b""
+def test_remove_mention_across_bmp_and_non_bmp_chars():
+    """Exact result for a mention preceded by both BMP and astral characters."""
+    text = "🙂é @testbot текст"
+    msg = FakeMessage(text=text, entities=mention_at(text, "@testbot"))
+    entity = find_bot_mention(msg, BOT)
+
+    assert entity is not None
+    assert entity.extract_from(text) == "@testbot"
+    assert remove_mention(text, entity) == "🙂é текст"
+
+
+def test_remove_mention_with_only_bmp_prefix():
+    text = "éж @testbot текст"
+    msg = FakeMessage(text=text, entities=mention_at(text, "@testbot"))
+    entity = find_bot_mention(msg, BOT)
+
+    assert entity is not None
+    assert remove_mention(text, entity) == "éж текст"
+
+
+def test_remove_mention_with_only_astral_prefix():
+    text = "🙂🙂 @testbot текст"
+    msg = FakeMessage(text=text, entities=mention_at(text, "@testbot"))
+    entity = find_bot_mention(msg, BOT)
+
+    assert entity is not None
+    assert remove_mention(text, entity) == "🙂🙂 текст"
+
+
+def test_remove_mention_at_end_after_astral():
+    text = "🙂 @testbot"
+    msg = FakeMessage(text=text, entities=mention_at(text, "@testbot"))
+    entity = find_bot_mention(msg, BOT)
+
+    assert entity is not None
+    assert remove_mention(text, entity) == "🙂"

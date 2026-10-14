@@ -1,16 +1,20 @@
 from collections.abc import Iterator
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.types import Chat, Message, MessageEntity, Update, User
+from structlog.testing import capture_logs
 
 from core.deduplication import InMemoryDeduplicator
-from core.models import RewriteError, RewriteResult
-from core.rate_limiter import CompositeRateLimiter, InMemoryRateLimiter
+from core.models import RewriteError, RewriteRequest, RewriteResult
+from core.rate_limiter import CompositeRateLimiter, InMemoryRateLimiter, WarningThrottle
 from core.service import RewriteService
 from handlers.rewrite import router as rewrite_router
+from llm.client import LLMClient, LLMClientError
 
 BOT_USERNAME = "testbot"
 BOT_ID = 777
@@ -35,6 +39,7 @@ def make_service(
     allowed_chat_ids: list[int] | None = None,
     user_limit: int = 20,
     chat_limit: int = 100,
+    throttle: WarningThrottle | None = None,
 ) -> RewriteService:
     return RewriteService(
         llm_client=llm,  # type: ignore[arg-type]
@@ -48,7 +53,24 @@ def make_service(
         allowed_chat_ids=allowed_chat_ids if allowed_chat_ids is not None else [-1001],
         bot_username=BOT_USERNAME,
         bot_id=BOT_ID,
+        warning_throttle=throttle,
     )
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_clock() -> FakeClock:
+    return FakeClock()
 
 
 def u16_offset(text: str, index: int) -> int:
@@ -124,6 +146,12 @@ def replies(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return sent
 
 
+@pytest.fixture
+def fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("llm.client.RETRY_BASE_SECONDS", 0.001)
+    monkeypatch.setattr("llm.client.RETRY_MAX_SECONDS", 0.002)
+
+
 async def feed(dp: Dispatcher, update: Update) -> None:
     bot = Bot(token=TOKEN)
     try:
@@ -137,6 +165,44 @@ def build_dp(service: RewriteService) -> Dispatcher:
     dp["service"] = service
     dp.include_router(rewrite_router)
     return dp
+
+
+def _request(source: str) -> RewriteRequest:
+    return RewriteRequest(
+        source_text=source,
+        user_instruction=None,
+        chat_id=-1001,
+        message_id=1,
+        message_thread_id=None,
+        user_id=1,
+    )
+
+
+def _make_real_client(monkeypatch: pytest.MonkeyPatch) -> LLMClient:
+    settings = SimpleNamespace(
+        llm_api_url="https://openrouter.ai/api/v1/chat/completions",
+        llm_api_key="sk-secret-key",
+        llm_model="poolside/laguna-s-2.1",
+        llm_timeout_seconds=5.0,
+        llm_max_tokens=100,
+        llm_temperature=0.3,
+        llm_json_mode=False,
+    )
+    monkeypatch.setattr("llm.client.get_settings", lambda: settings)
+    return LLMClient()
+
+
+def _attach(client: LLMClient, handler) -> list[dict]:
+    sent: list[dict] = []
+
+    def wrapper(request: httpx.Request) -> httpx.Response:
+        sent.append({"url": str(request.url), "auth": request.headers.get("authorization")})
+        return handler(request)
+
+    client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(wrapper), headers=dict(client._client.headers)
+    )
+    return sent
 
 
 # --- main behaviour: only reacts to mentions ------------------------------
@@ -327,15 +393,49 @@ async def test_invalid_request_does_not_consume_rate_limit(replies: list[str]) -
     assert "Слишком много запросов" not in " ".join(replies)
 
 
-async def test_user_rate_limit_blocks_call(replies: list[str]) -> None:
+async def test_user_rate_limit_warns_once_then_stays_silent(replies: list[str]) -> None:
     llm = StubLLM()
     dp = build_dp(make_service(llm, user_limit=1))
 
     await feed(dp, make_update(text="@testbot перепиши", message_id=1))
     await feed(dp, make_update(text="@testbot перепиши", message_id=2))
+    await feed(dp, make_update(text="@testbot перепиши", message_id=3))
 
     assert len(llm.calls) == 1
+    assert len(replies) == 2, "only the successful reply plus one warning"
     assert "Слишком много запросов" in replies[1]
+
+
+async def test_user_rate_limit_warning_repeats_after_window(
+    replies: list[str], fake_clock: FakeClock
+) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, user_limit=1, throttle=WarningThrottle(fake_clock)))
+
+    await feed(dp, make_update(text="@testbot перепиши", message_id=1))
+    await feed(dp, make_update(text="@testbot перепиши", message_id=2))
+    assert "Слишком много запросов" in replies[1]
+
+    # window expires; a fresh warning is allowed again
+    fake_clock.advance(61)
+    await feed(dp, make_update(text="@testbot перепиши", message_id=3))
+    await feed(dp, make_update(text="@testbot перепиши", message_id=4))
+
+    assert len(replies) == 3
+    assert "Слишком много запросов" in replies[2]
+
+
+async def test_chat_limit_warning_is_per_chat(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, chat_limit=1, user_limit=100))
+
+    await feed(dp, make_update(text="@testbot перепиши", message_id=1, user_id=1))
+    await feed(dp, make_update(text="@testbot перепиши", message_id=2, user_id=2))
+    await feed(dp, make_update(text="@testbot перепиши", message_id=3, user_id=3))
+
+    assert len(llm.calls) == 1
+    assert len(replies) == 2, "chat warning must not repeat per user"
+    assert "Чат достиг лимита" in replies[1]
 
 
 async def test_chat_rate_limit_blocks_call(replies: list[str]) -> None:
@@ -391,7 +491,27 @@ async def test_unexpected_error_is_caught(replies: list[str]) -> None:
     assert replies == ["Произошла ошибка. Попробуйте позже."]
 
 
-async def test_command_is_not_rewritten(replies: list[str]) -> None:
+async def test_command_with_mention_is_not_rewritten(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm))
+
+    await feed(dp, make_update(text="/start @testbot"))
+
+    assert llm.calls == []
+    assert replies == []
+
+
+async def test_command_with_bot_username_suffix_is_not_rewritten(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm))
+
+    await feed(dp, make_update(text="/rewrite@testbot текст"))
+
+    assert llm.calls == []
+    assert replies == []
+
+
+async def test_plain_command_is_not_rewritten(replies: list[str]) -> None:
     llm = StubLLM()
     dp = build_dp(make_service(llm))
 
@@ -401,10 +521,67 @@ async def test_command_is_not_rewritten(replies: list[str]) -> None:
     assert replies == []
 
 
-async def test_no_message_text_logged(replies: list[str], caplog: pytest.LogCaptureFixture) -> None:
+async def test_message_text_never_reaches_the_logs(replies: list[str]) -> None:
+    """The capture itself must be non-empty, otherwise the assertion below is vacuous."""
+    secret = "очень секретный текст"
     llm = StubLLM()
     dp = build_dp(make_service(llm))
 
-    await feed(dp, make_update(text="@testbot очень секретный текст"))
+    with capture_logs() as captured:
+        await feed(dp, make_update(text=f"@testbot {secret}"))
 
-    assert "очень секретный текст" not in caplog.text
+    assert captured, "structlog capture returned nothing, test would be vacuous"
+    assert any(entry.get("event") == "Rewrite successful" for entry in captured)
+    assert secret not in str(captured)
+
+
+async def test_source_text_never_reaches_the_logs_on_error(replies: list[str]) -> None:
+    secret = "суперсекретный исходник"
+    llm = StubLLM(error=RewriteError(message="boom", user_facing="Модель недоступна"))
+    dp = build_dp(make_service(llm))
+
+    with capture_logs() as captured:
+        await feed(dp, make_update(text=f"@testbot {secret}"))
+
+    assert captured
+    assert any(entry.get("event") == "Rewrite error" for entry in captured)
+    assert secret not in str(captured)
+
+
+async def test_source_text_never_reaches_llm_error_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "суперсекретный исходник"
+    client = _make_real_client(monkeypatch)
+    body = '{"error": {"message": "bad request"}}'
+    sent = _attach(client, lambda r: httpx.Response(400, text=body))
+
+    with pytest.raises(LLMClientError) as exc:
+        await client.rewrite(_request(secret), "стиль")
+
+    assert len(sent) == 1
+    assert secret not in exc.value.message
+    assert secret not in exc.value.user_facing
+
+
+async def test_logs_do_not_contain_api_key(
+    monkeypatch: pytest.MonkeyPatch, replies: list[str], fast_backoff: None
+) -> None:
+    client = _make_real_client(monkeypatch)
+    _attach(client, lambda r: httpx.Response(500, text="boom"))
+    dp = build_dp(
+        RewriteService(
+            llm_client=client,
+            deduplicator=InMemoryDeduplicator(),
+            rate_limiter=CompositeRateLimiter(
+                InMemoryRateLimiter(), InMemoryRateLimiter(), 20, 100
+            ),
+            allowed_chat_ids=[-1001],
+            bot_username=BOT_USERNAME,
+            bot_id=BOT_ID,
+        )
+    )
+
+    with capture_logs() as captured:
+        await feed(dp, make_update(text="@testbot текст"))
+
+    assert captured
+    assert "sk-secret-key" not in str(captured)

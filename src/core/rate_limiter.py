@@ -1,6 +1,7 @@
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
 
@@ -71,3 +72,31 @@ class CompositeRateLimiter:
         user_result = self.user_limiter.check_limit(f"user:{user_id}", self.user_limit)
         chat_result = self.chat_limiter.check_limit(f"chat:{chat_id}", self.chat_limit)
         return user_result, chat_result
+
+
+class WarningThrottle:
+    """Answers at most once per key until the advertised retry_after has passed.
+
+    # ponytail: in-process only; move to the same shared store as the limiter
+    # when running more than one instance.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._muted_until: dict[str, float] = {}
+        self._lock = Lock()
+
+    def should_warn(self, key: str, retry_after: float) -> bool:
+        now = self._clock()
+        with self._lock:
+            if self._muted_until.get(key, 0.0) > now:
+                return False
+            self._muted_until[key] = now + max(0.0, retry_after)
+            return True
+
+    def reset(self, key: str | None = None) -> None:
+        with self._lock:
+            if key is None:
+                self._muted_until.clear()
+            else:
+                self._muted_until.pop(key, None)

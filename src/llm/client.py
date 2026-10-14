@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 from dataclasses import dataclass
 
 import httpx
@@ -17,7 +18,11 @@ logger = logging.getLogger(__name__)
 
 # only transient failures are worth repeating
 RETRYABLE = (httpx.TimeoutException, httpx.ConnectError)
+RETRY_BASE_SECONDS = 1.0
+RETRY_MAX_SECONDS = 8.0
+RETRY_JITTER_RATIO = 0.25
 MAX_RETRY_AFTER_SECONDS = 30.0
+MALFORMED_RESPONSE = "Модель вернула некорректный ответ. Попробуйте ещё раз."
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -26,6 +31,13 @@ def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code == 429 or exc.response.status_code >= 500
     return False
+
+
+def _backoff(attempt: int) -> float:
+    """Exponential backoff with additive jitter; never below RETRY_BASE_SECONDS."""
+    growth: float = 2.0 ** max(0, attempt - 1)
+    base: float = min(RETRY_BASE_SECONDS * growth, RETRY_MAX_SECONDS)
+    return min(base + random.uniform(0.0, base * RETRY_JITTER_RATIO), RETRY_MAX_SECONDS)
 
 
 def _wait_before_retry(state: RetryCallState) -> float:
@@ -38,9 +50,7 @@ def _wait_before_retry(state: RetryCallState) -> float:
                 return min(float(retry_after), MAX_RETRY_AFTER_SECONDS)
             except ValueError:
                 pass
-    attempt = max(1, int(state.attempt_number))
-    delay: float = 0.05 * float(2 ** (attempt - 1))
-    return min(delay, 2.0)
+    return _backoff(max(1, int(state.attempt_number)))
 
 
 @dataclass(slots=True)
@@ -133,10 +143,24 @@ class LLMClient:
         reraise=True,
     )
     async def _post(self, payload: dict[str, object]) -> dict[str, object]:
-        """Single HTTP attempt. Raises raw httpx exceptions so tenacity can act on them."""
+        """Single HTTP attempt. Raises raw httpx exceptions so tenacity can act on them.
+
+        A malformed body raises LLMClientError, which is not retryable.
+        """
         response = await self._client.post(self._api_url, json=payload)
         response.raise_for_status()
-        data: dict[str, object] = response.json()
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise LLMClientError(
+                message="Response body is not valid JSON",
+                user_facing=MALFORMED_RESPONSE,
+            ) from e
+        if not isinstance(data, dict):
+            raise LLMClientError(
+                message=f"Unexpected JSON root: {type(data).__name__}",
+                user_facing=MALFORMED_RESPONSE,
+            )
         return data
 
     async def _call_api(self, messages: list[dict[str, str]]) -> LLMResponse:
@@ -184,14 +208,25 @@ class LLMClient:
                 user_facing="Не удалось связаться с моделью. Попробуйте позже.",
             ) from e
 
-        choices = data.get("choices") or []
+        choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise LLMClientError(
                 message="Malformed response: no choices",
-                user_facing="Модель вернула некорректный ответ. Попробуйте ещё раз.",
+                user_facing=MALFORMED_RESPONSE,
             )
-        message_obj = choices[0].get("message") or {}
-        content = message_obj.get("content") if isinstance(message_obj, dict) else None
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise LLMClientError(
+                message=f"Malformed choice: {type(first).__name__}",
+                user_facing=MALFORMED_RESPONSE,
+            )
+        message_obj = first.get("message")
+        if not isinstance(message_obj, dict):
+            raise LLMClientError(
+                message=f"Malformed message: {type(message_obj).__name__}",
+                user_facing=MALFORMED_RESPONSE,
+            )
+        content = message_obj.get("content")
 
         # outside the retry block on purpose: an empty answer must not become "Unexpected error"
         text, warning = self._parse_content(content) if isinstance(content, str) else ("", None)

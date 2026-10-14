@@ -1,7 +1,22 @@
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 SKILL_PATH = Path(__file__).resolve().parent.parent.parent / "runtime_skills" / "rewrite" / "SKILL.md"
 FALLBACK = "Стиль не задан. Переписывай естественно, сохраняя смысл."
+
+
+def strip_frontmatter(content: str) -> str:
+    """Drop a leading YAML frontmatter block, but only if it is properly closed."""
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return content
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return "\n".join(lines[index + 1 :])
+    # a lone horizontal rule is not frontmatter; keep the content as-is
+    return content
 
 
 class StyleLoader:
@@ -11,22 +26,32 @@ class StyleLoader:
         self._path = path
         self._cached: str = ""
         self._mtime: float | None = None
+        self._warned = False
+
+    def _warn_once(self, reason: str) -> None:
+        if self._warned:
+            return
+        self._warned = True
+        # never include the file contents in the log
+        logger.warning("Style file unavailable (%s), keeping last known style", reason)
 
     def load(self) -> str:
         try:
             mtime = self._path.stat().st_mtime
-        except OSError:
-            self._cached, self._mtime = FALLBACK, None
-            return FALLBACK
+        except OSError as e:
+            self._warn_once(f"stat failed: {e.__class__.__name__}")
+            return self._cached or FALLBACK
 
-        if mtime == self._mtime:
+        if self._cached and mtime == self._mtime:
             return self._cached
 
-        content = self._path.read_text(encoding="utf-8")
-        if content.startswith("---"):
-            parts = content.split("---", 2)
-            if len(parts) == 3:
-                content = parts[2]
-        self._cached = content.strip() or FALLBACK
+        try:
+            content = self._path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            self._warn_once(f"read failed: {e.__class__.__name__}")
+            return self._cached or FALLBACK
+
+        style = strip_frontmatter(content).strip() or FALLBACK
+        self._cached = style
         self._mtime = mtime
-        return self._cached
+        return style
