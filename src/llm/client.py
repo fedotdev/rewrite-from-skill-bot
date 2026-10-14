@@ -4,16 +4,43 @@ from dataclasses import dataclass
 
 import httpx
 from tenacity import (
+    RetryCallState,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
-    wait_exponential_jitter,
 )
 
 from config import get_settings
 from core.models import RewriteError, RewriteRequest, RewriteResult
 
 logger = logging.getLogger(__name__)
+
+# only transient failures are worth repeating
+RETRYABLE = (httpx.TimeoutException, httpx.ConnectError)
+MAX_RETRY_AFTER_SECONDS = 30.0
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, RETRYABLE):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429 or exc.response.status_code >= 500
+    return False
+
+
+def _wait_before_retry(state: RetryCallState) -> float:
+    outcome = state.outcome
+    exc = outcome.exception() if outcome is not None else None
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+        retry_after: str | None = exc.response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), MAX_RETRY_AFTER_SECONDS)
+            except ValueError:
+                pass
+    attempt = max(1, int(state.attempt_number))
+    delay: float = 0.05 * float(2 ** (attempt - 1))
+    return min(delay, 2.0)
 
 
 @dataclass(slots=True)
@@ -47,6 +74,17 @@ class LLMClient:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    def _build_payload(self, messages: list[dict[str, str]]) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": self._max_tokens,
+            "temperature": self._temperature,
+        }
+        if self._json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
 
     def _build_prompt(self, request: RewriteRequest, style_instructions: str) -> list[dict[str, str]]:
         json_rule = (
@@ -89,37 +127,21 @@ class LLMClient:
         return content.strip(), None
 
     @retry(
-        wait=wait_exponential_jitter(initial=1, max=10),
+        wait=_wait_before_retry,
         stop=stop_after_attempt(3),
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError)),
+        retry=retry_if_exception(_is_retryable),
         reraise=True,
     )
+    async def _post(self, payload: dict[str, object]) -> dict[str, object]:
+        """Single HTTP attempt. Raises raw httpx exceptions so tenacity can act on them."""
+        response = await self._client.post(self._api_url, json=payload)
+        response.raise_for_status()
+        data: dict[str, object] = response.json()
+        return data
+
     async def _call_api(self, messages: list[dict[str, str]]) -> LLMResponse:
-        payload: dict[str, object] = {
-            "model": self._model,
-            "messages": messages,
-            "max_tokens": self._max_tokens,
-            "temperature": self._temperature,
-        }
-        if self._json_mode:
-            payload["response_format"] = {"type": "json_object"}
-
         try:
-            response = await self._client.post(self._api_url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-
-            content = data["choices"][0]["message"]["content"]
-            text, warning = self._parse_content(content)
-
-            if not text:
-                raise LLMClientError(
-                    message="LLM returned empty text",
-                    user_facing="Модель вернула пустой ответ. Попробуйте ещё раз.",
-                )
-
-            return LLMResponse(text=text, warning=warning)
-
+            data = await self._post(self._build_payload(messages))
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             if status == 429:
@@ -156,12 +178,29 @@ class LLMClient:
                 message=f"LLM timeout: {e}",
                 user_facing="Модель не отвечает. Попробуйте ещё раз.",
             ) from e
-        except Exception as e:
-            logger.exception("Unexpected LLM error")
+        except httpx.HTTPError as e:
             raise LLMClientError(
-                message=f"Unexpected error: {e}",
-                user_facing="Произошла ошибка. Попробуйте позже.",
+                message=f"LLM transport error: {e}",
+                user_facing="Не удалось связаться с моделью. Попробуйте позже.",
             ) from e
+
+        choices = data.get("choices") or []
+        if not isinstance(choices, list) or not choices:
+            raise LLMClientError(
+                message="Malformed response: no choices",
+                user_facing="Модель вернула некорректный ответ. Попробуйте ещё раз.",
+            )
+        message_obj = choices[0].get("message") or {}
+        content = message_obj.get("content") if isinstance(message_obj, dict) else None
+
+        # outside the retry block on purpose: an empty answer must not become "Unexpected error"
+        text, warning = self._parse_content(content) if isinstance(content, str) else ("", None)
+        if not text:
+            raise LLMClientError(
+                message="LLM returned empty text",
+                user_facing="Модель вернула пустой ответ. Попробуйте ещё раз.",
+            )
+        return LLMResponse(text=text, warning=warning)
 
     async def rewrite(self, request: RewriteRequest, style_instructions: str) -> RewriteResult:
         messages = self._build_prompt(request, style_instructions)

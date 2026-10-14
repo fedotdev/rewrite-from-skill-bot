@@ -17,10 +17,13 @@ class RewriteResult:
     warning: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
 class RewriteError(Exception):
-    message: str
-    user_facing: str
+    # plain exception on purpose: a frozen+slots dataclass base breaks when the
+    # error is raised while another exception is being handled (contextlib/chaining)
+    def __init__(self, message: str, user_facing: str) -> None:
+        super().__init__(message)
+        self.message = message
+        self.user_facing = user_facing
 
     def __str__(self) -> str:
         return self.message

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from aiogram.types import Message, MessageEntity
+from aiogram.utils.text_decorations import add_surrogates, remove_surrogates
 
 from core.models import RewriteError, RewriteRequest
 
@@ -9,105 +10,102 @@ from core.models import RewriteError, RewriteRequest
 class ParsedMessage:
     source_text: str
     user_instruction: str | None
-    has_reply: bool
 
 
 class MessageParseError(RewriteError):
     pass
 
 
-def get_text_and_entities(message: Message) -> tuple[str | None, tuple[MessageEntity, ...]]:
+def get_text_and_entities(message: Message) -> tuple[str, tuple[MessageEntity, ...]]:
     if message.text is not None:
         return message.text, tuple(message.entities or ())
-    return message.caption, tuple(message.caption_entities or ())
+    return message.caption or "", tuple(message.caption_entities or ())
 
 
-def extract_mention_entity(message: Message, bot_username: str) -> MessageEntity | None:
+def get_text_content(message: Message) -> str:
+    text, _ = get_text_and_entities(message)
+    return text
+
+
+def find_bot_mention(
+    message: Message,
+    bot_username: str,
+    bot_id: int | None = None,
+) -> MessageEntity | None:
     text, entities = get_text_and_entities(message)
-    if not text:
+    if not text or not entities:
         return None
-    expected = f"@{bot_username.lower()}"
+
+    expected = f"@{bot_username.lstrip('@').lower()}"
     for entity in entities:
-        if entity.type == "mention" and text[entity.offset : entity.offset + entity.length].lower() == expected:
-            return entity
+        if entity.type == "mention":
+            # entity.offset/length are UTF-16 code units; extract_from handles surrogates
+            if entity.extract_from(text).lower() == expected:
+                return entity
+        elif entity.type == "text_mention" and bot_id is not None:
+            if entity.user is not None and entity.user.id == bot_id:
+                return entity
     return None
 
 
 def remove_mention(text: str, entity: MessageEntity) -> str:
-    before = text[:entity.offset]
-    after = text[entity.offset + entity.length:]
-    result = before + after
-    return " ".join(result.split())
+    raw = add_surrogates(text)
+    start = entity.offset * 2
+    end = (entity.offset + entity.length) * 2
+    before = remove_surrogates(raw[:start])
+    after = remove_surrogates(raw[end:])
 
-
-def get_text_content(message: Message) -> str | None:
-    if message.text:
-        return message.text
-    if message.caption:
-        return message.caption
-    return None
+    # fix only the double space left at the cut; newlines and other spacing are preserved
+    if before.endswith(" ") and after.startswith(" "):
+        after = after[1:]
+    return (before + after).strip()
 
 
 def parse_rewrite_request(
     message: Message,
     bot_username: str,
-) -> ParsedMessage:
-    mention_entity = extract_mention_entity(message, bot_username)
-    has_reply = message.reply_to_message is not None
+    bot_id: int | None = None,
+) -> ParsedMessage | None:
+    """Returns None when the bot is not mentioned - the caller must stay silent."""
+    mention_entity = find_bot_mention(message, bot_username, bot_id)
+    if mention_entity is None:
+        return None
 
-    if not mention_entity and not has_reply:
-        raise MessageParseError(
-            message="No mention and no reply",
-            user_facing="Напишите @bot <текст> или ответьте на сообщение с упоминанием @bot.",
-        )
-
-    if mention_entity and not has_reply:
-        # @bot текст — переписываем текст после упоминания
-        full_text = get_text_content(message)
-        if not full_text:
-            raise MessageParseError(
-                message="Mention without text content",
-                user_facing="После @bot должен быть текст для переписывания.",
-            )
-        source_text = remove_mention(full_text, mention_entity)
-        if not source_text:
-            raise MessageParseError(
-                message="Empty text after mention",
-                user_facing="Текст после @bot не может быть пустым.",
-            )
-        return ParsedMessage(
-            source_text=source_text,
-            user_instruction=None,
-            has_reply=False,
-        )
-
-    # Has reply
     replied = message.reply_to_message
-    assert replied is not None
-    replied_text = get_text_content(replied)
-    if not replied_text:
-        raise MessageParseError(
-            message="Replied message has no text or caption",
-            user_facing="Можно переписывать только текстовые сообщения или подписи к медиа.",
+
+    if replied is not None:
+        # the quoted message is always the source; current text is only an instruction
+        replied_text = get_text_content(replied)
+        if not replied_text:
+            raise MessageParseError(
+                message="Replied message has no text or caption",
+                user_facing="Можно переписывать только текстовые сообщения или подписи к медиа.",
+            )
+        current_text, _ = get_text_and_entities(message)
+        instruction = remove_mention(current_text, mention_entity) if current_text else ""
+        return ParsedMessage(
+            source_text=replied_text,
+            user_instruction=instruction or None,
         )
 
-    user_instruction = None
-    if mention_entity:
-        full_text = get_text_content(message)
-        if full_text:
-            instruction = remove_mention(full_text, mention_entity)
-            if instruction:
-                user_instruction = instruction
-
-    return ParsedMessage(
-        source_text=replied_text,
-        user_instruction=user_instruction,
-        has_reply=True,
-    )
+    own_text, _ = get_text_and_entities(message)
+    source_text = remove_mention(own_text, mention_entity) if own_text else ""
+    if not source_text:
+        raise MessageParseError(
+            message="Bare mention without text",
+            user_facing="Напишите текст после упоминания или ответьте на сообщение с упоминанием.",
+        )
+    return ParsedMessage(source_text=source_text, user_instruction=None)
 
 
-def build_rewrite_request(message: Message, bot_username: str) -> RewriteRequest:
-    parsed = parse_rewrite_request(message, bot_username)
+def build_rewrite_request(
+    message: Message,
+    bot_username: str,
+    bot_id: int | None = None,
+) -> RewriteRequest | None:
+    parsed = parse_rewrite_request(message, bot_username, bot_id)
+    if parsed is None:
+        return None
     return RewriteRequest(
         source_text=parsed.source_text,
         user_instruction=parsed.user_instruction,

@@ -22,7 +22,9 @@ async def main() -> None:
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties())
 
     bot_info = await bot.get_me()
-    bot_username = bot_info.username or ""
+    if not bot_info.username:
+        await bot.session.close()
+        raise RuntimeError("Telegram did not return a username for this bot; cannot detect mentions")
 
     llm_client = LLMClient()
     deduplicator = InMemoryDeduplicator()
@@ -40,14 +42,21 @@ async def main() -> None:
         deduplicator=deduplicator,
         rate_limiter=rate_limiter,
         allowed_chat_ids=settings.allowed_chat_ids,
+        bot_username=bot_info.username,
+        bot_id=bot_info.id,
     )
-    service.set_bot_username(bot_username)
+
+    if not service.has_allowed_chats:
+        logger.warning(
+            "ALLOWED_CHAT_IDS is empty - the bot will not respond anywhere",
+            allowed_chats=[],
+        )
 
     dp = Dispatcher()
     dp["service"] = service
     dp.include_router(rewrite_router)
 
-    logger.info("Bot started", username=bot_username, allowed_chats=settings.allowed_chat_ids)
+    logger.info("Bot started", username=bot_info.username, allowed_chats=settings.allowed_chat_ids)
 
     try:
         await dp.start_polling(bot)
