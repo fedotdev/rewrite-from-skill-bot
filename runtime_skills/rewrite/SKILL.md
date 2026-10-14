@@ -22,3 +22,6 @@ description: Base rewrite style for the Telegram bot. Defines how messages shoul
 - Если исходник длинный — сжимай до сути, но не теряй детали
 - Не объясняй, почему переписал так
 - Верни только результат
+
+## Справочники
+- Жанровые правила по типам сообщений: references/genres.md

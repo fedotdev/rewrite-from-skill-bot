@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from core.models import RewriteRequest, RewriteResult
+from core.style_loader import StyleLoader
 from llm.client import LLMClient, LLMClientError, _backoff
 
 
@@ -424,3 +425,62 @@ async def test_style_is_injected_into_prompt(monkeypatch: pytest.MonkeyPatch) ->
     await client.rewrite(make_request(), "ОСОБЫЙ СТИЛЬ")
 
     assert "ОСОБЫЙ СТИЛЬ" in sent[0]["messages"][0]["content"]
+
+
+# --- style assembled from SKILL.md + references ---------------------------
+
+
+async def test_reference_content_reaches_the_llm_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole chain: StyleLoader -> RewriteService -> LLMClient -> HTTP body."""
+    from core.deduplication import InMemoryDeduplicator
+    from core.models import RewriteRequest
+    from core.rate_limiter import CompositeRateLimiter, InMemoryRateLimiter
+    from core.service import RewriteService
+    from core.style_loader import StyleLoader
+
+    client = make_client(monkeypatch)
+    sent = attach(client, lambda r: ok("готово"))
+    service = RewriteService(
+        llm_client=client,
+        deduplicator=InMemoryDeduplicator(),
+        rate_limiter=CompositeRateLimiter(
+            InMemoryRateLimiter(), InMemoryRateLimiter(), 20, 100
+        ),
+        allowed_chat_ids=[-1],
+        bot_username="testbot",
+        bot_id=1,
+        style_loader=StyleLoader(),
+    )
+
+    await service.process(
+        RewriteRequest(
+            source_text="привет",
+            user_instruction=None,
+            chat_id=-1,
+            message_id=1,
+            message_thread_id=None,
+            user_id=1,
+        )
+    )
+
+    system = sent[0]["messages"][0]["content"]
+    assert "Инструкции стиля" in system, "SKILL.md body must reach the prompt"
+    assert "## Справочник: genres.md" in system, "reference heading must reach the prompt"
+    assert "Жанры сообщений" in system, "genres.md content must reach the prompt"
+    assert "Техническое описание" in system
+
+
+async def test_reference_content_is_not_sent_as_user_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """References belong to the style, not to the user's text block."""
+    client = make_client(monkeypatch)
+    sent = attach(client, lambda r: ok("x"))
+
+    await client.rewrite(make_request("исходник"), StyleLoader().load())
+
+    user = sent[0]["messages"][1]["content"]
+    assert "Жанры сообщений" not in user
+    assert "исходник" in user
