@@ -65,13 +65,30 @@ def parse_rewrite_request(
     message: Message,
     bot_username: str,
     bot_id: int | None = None,
+    *,
+    private: bool = False,
+    max_source_chars: int = 3000,
 ) -> ParsedMessage | None:
-    """Returns None when the bot is not mentioned - the caller must stay silent."""
+    """Parse a group mention or an unmentioned private-chat request."""
     mention_entity = find_bot_mention(message, bot_username, bot_id)
-    if mention_entity is None:
+    if not private and mention_entity is None:
         return None
 
     replied = message.reply_to_message
+
+    if private and message.forward_origin is not None:
+        source_text = get_text_content(message)
+        if not source_text:
+            raise MessageParseError(
+                message="Forwarded message has no text or caption",
+                user_facing="Можно переписывать только пересланный текст или подпись к медиа.",
+            )
+        if len(source_text) > max_source_chars:
+            raise MessageParseError(
+                message="Source exceeds configured limit",
+                user_facing=f"Текст слишком длинный. Максимум — {max_source_chars} символов.",
+            )
+        return ParsedMessage(source_text=source_text, user_instruction=None)
 
     if replied is not None:
         # the quoted message is always the source; current text is only an instruction
@@ -92,19 +109,35 @@ def parse_rewrite_request(
                 )
             replied_text = stripped
 
+        if private and len(replied_text) > max_source_chars:
+            raise MessageParseError(
+                message="Source exceeds configured limit",
+                user_facing=f"Текст слишком длинный. Максимум — {max_source_chars} символов.",
+            )
         current_text, _ = get_text_and_entities(message)
-        instruction = remove_mention(current_text, mention_entity) if current_text else ""
-        return ParsedMessage(
-            source_text=replied_text,
-            user_instruction=instruction or None,
+        instruction = (
+            remove_mention(current_text, mention_entity)
+            if mention_entity is not None
+            else current_text
         )
+        return ParsedMessage(source_text=replied_text, user_instruction=instruction or None)
 
     own_text, _ = get_text_and_entities(message)
-    source_text = remove_mention(own_text, mention_entity) if own_text else ""
+    source_text = remove_mention(own_text, mention_entity) if mention_entity else own_text
     if not source_text:
+        if mention_entity is not None:
+            raise MessageParseError(
+                message="Bare mention without text",
+                user_facing="Напишите текст после упоминания или ответьте на сообщение с упоминанием.",
+            )
         raise MessageParseError(
-            message="Bare mention without text",
-            user_facing="Напишите текст после упоминания или ответьте на сообщение с упоминанием.",
+            message="Message has no text or caption",
+            user_facing="Пришлите текст или фото с подписью — я перепишу его.",
+        )
+    if len(source_text) > max_source_chars:
+        raise MessageParseError(
+            message="Source exceeds configured limit",
+            user_facing=f"Текст слишком длинный. Максимум — {max_source_chars} символов.",
         )
     return ParsedMessage(source_text=source_text, user_instruction=None)
 
@@ -113,8 +146,17 @@ def build_rewrite_request(
     message: Message,
     bot_username: str,
     bot_id: int | None = None,
+    *,
+    private: bool = False,
+    max_source_chars: int = 3000,
 ) -> RewriteRequest | None:
-    parsed = parse_rewrite_request(message, bot_username, bot_id)
+    parsed = parse_rewrite_request(
+        message,
+        bot_username,
+        bot_id,
+        private=private,
+        max_source_chars=max_source_chars,
+    )
     if parsed is None:
         return None
     return RewriteRequest(

@@ -26,6 +26,7 @@ class FakeMessage:
         self.entities = entities or []
         self.caption_entities = []
         self.reply_to_message = reply_to_message
+        self.forward_origin = None
 
 
 class FakeCaptionMessage(FakeMessage):
@@ -125,6 +126,28 @@ def test_reply_to_caption_message():
     parsed = parse_rewrite_request(bot_message("@testbot", reply_to_message=quoted), BOT)
     assert parsed is not None
     assert parsed.source_text == "подпись к медиа"
+
+
+def test_private_forward_uses_forwarded_text_as_source():
+    forwarded = FakeMessage(text="текст пересланного сообщения")
+    forwarded.forward_origin = object()
+
+    parsed = parse_rewrite_request(forwarded, BOT, private=True)
+
+    assert parsed is not None
+    assert parsed.source_text == "текст пересланного сообщения"
+    assert parsed.user_instruction is None
+
+
+def test_private_forward_uses_forwarded_caption_as_source():
+    forwarded = FakeCaptionMessage(caption="подпись пересланного сообщения")
+    forwarded.forward_origin = object()
+
+    parsed = parse_rewrite_request(forwarded, BOT, private=True)
+
+    assert parsed is not None
+    assert parsed.source_text == "подпись пересланного сообщения"
+    assert parsed.user_instruction is None
 
 
 def test_reply_to_message_without_text_raises():

@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 import pytest
 from aiogram import Bot, Dispatcher
-from aiogram.types import Chat, Message, MessageEntity, Update, User
+from aiogram.types import Chat, Message, MessageEntity, MessageOriginUser, Update, User
 from structlog.testing import capture_logs
 
 from core.deduplication import InMemoryDeduplicator
@@ -40,6 +40,9 @@ def make_service(
     user_limit: int = 20,
     chat_limit: int = 100,
     throttle: WarningThrottle | None = None,
+    private_access: str = "allowlist",
+    private_user_limit: int = 10,
+    private_global_limit: int = 500,
 ) -> RewriteService:
     return RewriteService(
         llm_client=llm,  # type: ignore[arg-type]
@@ -54,6 +57,9 @@ def make_service(
         bot_username=BOT_USERNAME,
         bot_id=BOT_ID,
         warning_throttle=throttle,
+        private_access=private_access,
+        private_user_limit_per_hour=private_user_limit,
+        private_global_limit_per_day=private_global_limit,
     )
 
 
@@ -85,6 +91,8 @@ def make_update(
     message_id: int = 1,
     reply_to: Message | None = None,
     caption: str | None = None,
+    chat_type: str = "group",
+    forward: bool = False,
 ) -> Update:
     entities = None
     caption_entities = None
@@ -103,13 +111,18 @@ def make_update(
         message=Message(
             message_id=message_id,
             date=datetime.now(),
-            chat=Chat(id=chat_id, type="group"),
+            chat=Chat(id=chat_id, type=chat_type),
             from_user=User(id=user_id, is_bot=False, first_name="u"),
             text=text,
             entities=entities,
             caption=caption,
             caption_entities=caption_entities,
             reply_to_message=reply_to,
+            forward_origin=(
+                MessageOriginUser(type="user", date=datetime.now(), sender_user=User(id=99, is_bot=False, first_name="f"))
+                if forward
+                else None
+            ),
         ),
     )
 
@@ -353,6 +366,139 @@ async def test_empty_allowlist_admits_nobody(replies: list[str]) -> None:
     dp = build_dp(make_service(llm, allowed_chat_ids=[]))
 
     await feed(dp, make_update(text="@testbot перепиши"))
+
+    assert llm.calls == []
+    assert replies == []
+
+
+async def test_open_private_rewrites_plain_message(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[], private_access="open"))
+
+    await feed(dp, make_update(text="перепиши", chat_id=42, chat_type="private", mention=False))
+
+    assert llm.calls == [("перепиши", None)]
+    assert replies == ["rewritten"]
+
+
+async def test_private_allowlist_uses_user_id(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[42]))
+
+    await feed(dp, make_update(text="текст", chat_id=42, user_id=42, chat_type="private", mention=False))
+    await feed(dp, make_update(text="текст", chat_id=42, user_id=43, chat_type="private", mention=False, message_id=2))
+
+    assert len(llm.calls) == 1
+    assert replies == ["rewritten"]
+
+
+async def test_open_private_reply_uses_quote_as_source(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[], private_access="open"))
+
+    await feed(dp, make_update(text="сократи", chat_id=42, chat_type="private", mention=False,
+                               reply_to=quoted(text="исходник")))
+
+    assert llm.calls == [("исходник", "сократи")]
+
+
+async def test_open_private_help_command(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[], private_access="open"))
+
+    await feed(dp, make_update(text="/help", chat_id=42, chat_type="private", mention=False))
+
+    assert llm.calls == []
+    assert len(replies) == 1 and "стороннему LLM-провайдеру" in replies[0]
+
+
+async def test_open_private_start_command_replies_without_llm(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[], private_access="open"))
+
+    await feed(dp, make_update(text="/start", chat_id=42, chat_type="private", mention=False))
+
+    assert llm.calls == []
+    assert len(replies) == 1
+
+
+async def test_open_private_privacy_command_answers_without_llm(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[], private_access="open"))
+
+    await feed(dp, make_update(text="/privacy", chat_id=42, chat_type="private", mention=False))
+
+    assert llm.calls == []
+    assert len(replies) == 1
+    assert "LLM" in replies[0]
+    assert "Я переписываю текст" not in replies[0]
+
+
+async def test_open_private_forward_is_rewritten(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[], private_access="open"))
+
+    await feed(dp, make_update(text="пересланный текст", chat_id=42, chat_type="private", mention=False,
+                               forward=True))
+
+    assert llm.calls == [("пересланный текст", None)]
+
+
+async def test_private_limits_are_independent(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[], private_access="open", private_user_limit=1))
+
+    await feed(dp, make_update(text="один", chat_id=42, user_id=1, chat_type="private", mention=False))
+    await feed(dp, make_update(text="два", chat_id=43, user_id=2, chat_type="private", mention=False))
+
+    assert len(llm.calls) == 2
+
+
+async def test_private_user_limit_warns_once(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[], private_access="open", private_user_limit=1))
+
+    for message_id in range(1, 4):
+        await feed(dp, make_update(text="текст", chat_id=42, user_id=1, message_id=message_id,
+                                   chat_type="private", mention=False))
+
+    assert len(llm.calls) == 1
+    assert sum("Слишком много запросов" in reply for reply in replies) == 1
+
+
+async def test_private_global_limit_warns_once(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[], private_access="open",
+                               private_global_limit=1))
+
+    for message_id, user_id in enumerate((1, 2, 3), 1):
+        await feed(dp, make_update(text="текст", chat_id=user_id, user_id=user_id,
+                                   message_id=message_id, chat_type="private", mention=False))
+
+    assert len(llm.calls) == 1
+    assert sum("Лимит запросов исчерпан" in reply for reply in replies) == 1
+
+
+async def test_oversize_private_request_does_not_consume_limit(replies: list[str]) -> None:
+    llm = StubLLM()
+    service = make_service(llm, allowed_chat_ids=[], private_access="open", private_user_limit=1)
+    service._max_source_chars = 3
+    dp = build_dp(service)
+
+    await feed(dp, make_update(text="слишком длинно", chat_id=42, chat_type="private", mention=False))
+    await feed(dp, make_update(text="ок", chat_id=42, chat_type="private", mention=False, message_id=2))
+
+    assert llm.calls == [("ок", None)]
+    assert len(replies) == 2
+    assert "Слишком много запросов" not in replies[0]
+
+
+async def test_group_still_requires_allowlist_and_mention(replies: list[str]) -> None:
+    llm = StubLLM()
+    dp = build_dp(make_service(llm, allowed_chat_ids=[-1001], private_access="open"))
+
+    await feed(dp, make_update(text="обычный текст", mention=False))
+    await feed(dp, make_update(text="@testbot текст", chat_id=-1002))
 
     assert llm.calls == []
     assert replies == []

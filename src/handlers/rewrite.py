@@ -12,16 +12,49 @@ logger = get_logger(__name__)
 router = Router()
 
 
+class PrivateCommandFilter(Filter):
+    async def __call__(self, message: Message, service: RewriteService) -> bool:
+        if message.chat.type != "private":
+            return False
+        text = message.text or message.caption or ""
+        command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        return command in {"/start", "/help", "/privacy"} and service.is_allowed_chat(
+            user_id, message.chat.type
+        )
+
+
+HELP_TEXT = (
+    "Я переписываю текст по вашему запросу. Пришлите текст или ответьте на сообщение "
+    "с инструкцией. Текст отправляется стороннему LLM-провайдеру, но в логи не записывается."
+)
+PRIVACY_TEXT = (
+    "Текст вашего запроса отправляется стороннему LLM-провайдеру для обработки. "
+    "В логи приложения текст не записывается."
+)
+
+
+@router.message(PrivateCommandFilter())
+async def handle_help(message: Message) -> None:
+    command = (message.text or message.caption or "").split(maxsplit=1)[0].split("@", 1)[0]
+    await message.reply(PRIVACY_TEXT if command == "/privacy" else HELP_TEXT)
+
+
+class AccessFilter(Filter):
+    async def __call__(self, message: Message, service: RewriteService) -> bool:
+        if message.chat.type not in {"private", "group", "supergroup"}:
+            return False
+        identifier = (
+            message.from_user.id
+            if message.chat.type == "private" and message.from_user
+            else message.chat.id
+        )
+        return service.is_allowed_chat(identifier, message.chat.type)
+
+
 class MentionFilter(Filter):
-    """Bot reacts only when it is actually mentioned."""
-
     async def __call__(self, message: Message, service: RewriteService) -> bool:
-        return service.find_mention(message) is not None
-
-
-class AllowedChatFilter(Filter):
-    async def __call__(self, message: Message, service: RewriteService) -> bool:
-        return service.is_allowed_chat(message.chat.id)
+        return message.chat.type == "private" or service.find_mention(message) is not None
 
 
 class NotCommandFilter(Filter):
@@ -30,11 +63,17 @@ class NotCommandFilter(Filter):
         return not (text or "").startswith("/")
 
 
-@router.message(MentionFilter(), AllowedChatFilter(), NotCommandFilter())
+@router.message(AccessFilter(), MentionFilter(), NotCommandFilter())
 async def handle_rewrite(message: Message, service: RewriteService) -> None:
     # parse first: invalid or empty requests must not consume rate limit
     try:
-        request = build_rewrite_request(message, service.bot_username, service.bot_id)
+        request = build_rewrite_request(
+            message,
+            service.bot_username,
+            service.bot_id,
+            private=message.chat.type == "private",
+            max_source_chars=service.max_source_chars,
+        )
         if request is None:
             return
     except RewriteError as e:
@@ -46,19 +85,33 @@ async def handle_rewrite(message: Message, service: RewriteService) -> None:
         return
 
     user_id = message.from_user.id if message.from_user else 0
-    user_result, chat_result = service.check_rate_limits(user_id, message.chat.id)
+    if message.chat.type == "private":
+        user_result, chat_result = service.check_private_rate_limits(user_id)
+    else:
+        user_result, chat_result = service.check_rate_limits(user_id, message.chat.id)
     if not user_result.allowed:
-        if service.should_warn_user_limit(
-            message.chat.id, user_id, user_result.retry_after_seconds
-        ):
+        throttle_key = (
+            f"private-user:{user_id}"
+            if message.chat.type == "private"
+            else f"user:{message.chat.id}:{user_id}"
+        )
+        if service.should_warn(throttle_key, user_result.retry_after_seconds):
             await message.reply(
                 f"Слишком много запросов. Попробуйте через {int(user_result.retry_after_seconds)} сек."
             )
         return
     if not chat_result.allowed:
-        if service.should_warn_chat_limit(message.chat.id, chat_result.retry_after_seconds):
+        throttle_key = (
+            "private-global" if message.chat.type == "private" else f"chat:{message.chat.id}"
+        )
+        if service.should_warn(throttle_key, chat_result.retry_after_seconds):
+            warning = (
+                "Чат достиг лимита."
+                if message.chat.type != "private"
+                else "Лимит запросов исчерпан."
+            )
             await message.reply(
-                f"Чат достиг лимита. Попробуйте через {int(chat_result.retry_after_seconds)} сек."
+                f"{warning} Попробуйте через {int(chat_result.retry_after_seconds)} сек."
             )
         return
 

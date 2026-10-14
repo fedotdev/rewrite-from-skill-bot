@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,6 +15,16 @@ class Settings(BaseSettings):
 
     bot_token: str = Field(..., validation_alias="BOT_TOKEN")
     allowed_chat_ids: list[int] = Field(default_factory=list, validation_alias="ALLOWED_CHAT_IDS")
+    private_access: Literal["open", "allowlist"] = Field(
+        default="allowlist", validation_alias="PRIVATE_ACCESS"
+    )
+    private_user_limit_per_hour: int = Field(
+        default=10, validation_alias="PRIVATE_USER_LIMIT_PER_HOUR"
+    )
+    private_global_limit_per_day: int = Field(
+        default=500, validation_alias="PRIVATE_GLOBAL_LIMIT_PER_DAY"
+    )
+    max_source_chars: int = Field(default=3000, validation_alias="MAX_SOURCE_CHARS")
 
     llm_api_url: str = Field(default="https://api.openai.com/v1/chat/completions", validation_alias="LLM_API_URL")
     llm_api_key: str = Field(..., validation_alias="LLM_API_KEY")

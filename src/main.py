@@ -44,6 +44,10 @@ async def main() -> None:
         allowed_chat_ids=settings.allowed_chat_ids,
         bot_username=bot_info.username,
         bot_id=bot_info.id,
+        private_access=settings.private_access,
+        max_source_chars=settings.max_source_chars,
+        private_user_limit_per_hour=settings.private_user_limit_per_hour,
+        private_global_limit_per_day=settings.private_global_limit_per_day,
     )
 
     if not service.has_allowed_chats:
