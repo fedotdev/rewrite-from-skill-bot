@@ -559,6 +559,34 @@ def test_real_tree_includes_genres_reference() -> None:
     assert "Жанры сообщений" in style
 
 
+def test_real_tree_keeps_the_link_out_of_the_model_prompt() -> None:
+    """The link drives discovery via frontmatter, so the model must not see it."""
+    style = StyleLoader().load()
+    body = style.split("---", 1)[0]
+
+    assert "references/genres.md" not in body
+    assert "references/genres.md" not in style, "not even inside the appendix"
+    assert "Справочник: genres.md" in body, "the body must point at the section below"
+    assert "## Справочник: genres.md" in style
+
+
+def test_reference_in_frontmatter_is_discovered_but_hidden(tmp_path) -> None:
+    root = tmp_path / "skill"
+    root.mkdir()
+    write(
+        root / "SKILL.md",
+        "---\nname: s\nreferences:\n  - references/genres.md\n---\n\nТЕЛО\nсм. раздел ниже\n",
+    )
+    (root / "references").mkdir()
+    write(root / "references" / "genres.md", "ЖАНРЫ")
+
+    style = StyleLoader(root / "SKILL.md").load()
+
+    assert "## Справочник: genres.md" in style
+    assert "ЖАНРЫ" in style
+    assert "references/genres.md" not in style
+
+
 def test_real_skill_links_resolve_to_existing_files() -> None:
     content = (SKILL_PATH).read_text(encoding="utf-8")
     links = discover_references(content)

@@ -1,6 +1,8 @@
 ---
 name: rewrite-style
 description: Base rewrite style for the Telegram bot. Defines how messages should be rewritten.
+references:
+  - references/genres.md
 ---
 
 # Инструкции стиля переписывания
@@ -24,4 +26,4 @@ description: Base rewrite style for the Telegram bot. Defines how messages shoul
 - Верни только результат
 
 ## Справочники
-- Жанровые правила по типам сообщений: references/genres.md
+- Правила по жанрам сообщений разобраны в разделе «Справочник: genres.md» ниже
