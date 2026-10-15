@@ -68,9 +68,9 @@ class RewriteService:
         return find_bot_mention(message, self._bot_username, self._bot_id)
 
     def is_allowed_chat(self, chat_id: int, chat_type: str = "group") -> bool:
-        return (chat_type == "private" and self._private_access == "open") or (
-            chat_type in {"group", "supergroup", "private"} and chat_id in self._allowed_chats
-        )
+        return chat_type == "private" and (
+            self._private_access == "open" or chat_id in self._allowed_chats
+        ) or chat_type in {"group", "supergroup"} and chat_id in self._allowed_chats
 
     @property
     def max_source_chars(self) -> int:
